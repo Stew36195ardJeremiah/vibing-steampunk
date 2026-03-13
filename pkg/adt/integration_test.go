@@ -11,38 +11,173 @@ import (
 	"time"
 )
 
-// Integration tests require SAP_URL, SAP_USER, SAP_PASSWORD environment variables.
-// Run with: go test -tags=integration -v ./pkg/adt/
+// Integration tests require a live SAP system.
+//
+// Quickstart:
+//
+//	export SAP_URL=http://localhost:50000
+//	export SAP_USER=DEVELOPER
+//	export SAP_PASSWORD=ABAPtr2023#00
+//	export SAP_CLIENT=001
+//	go test -tags=integration -v ./pkg/adt/
+//
+// Useful env vars:
+//
+//	SAP_TEST_VERBOSE=true       — log every HTTP request/response body
+//	SAP_TEST_NO_CLEANUP=true    — keep ZTEST_* objects on SAP for manual inspection
 
-func getIntegrationClient(t *testing.T) *Client {
+// ─── testLogger ────────────────────────────────────────────────────────────────
+//
+// Provides timestamped, levelled output so test logs are easy to scan.
+// All lines start with [INFO], [DEBUG], or [WARN] plus elapsed ms.
+// DEBUG lines are suppressed unless SAP_TEST_VERBOSE=true.
+
+type testLogger struct {
+	t       *testing.T
+	verbose bool
+	start   time.Time
+}
+
+func newTestLogger(t *testing.T) *testLogger {
+	t.Helper()
+	return &testLogger{
+		t:       t,
+		verbose: os.Getenv("SAP_TEST_VERBOSE") == "true",
+		start:   time.Now(),
+	}
+}
+
+func (l *testLogger) Info(format string, args ...any) {
+	l.t.Helper()
+	l.t.Logf("[INFO  +%6v] %s", time.Since(l.start).Round(time.Millisecond), fmt.Sprintf(format, args...))
+}
+
+func (l *testLogger) Debug(format string, args ...any) {
+	if !l.verbose {
+		return
+	}
+	l.t.Helper()
+	l.t.Logf("[DEBUG +%6v] %s", time.Since(l.start).Round(time.Millisecond), fmt.Sprintf(format, args...))
+}
+
+func (l *testLogger) Warn(format string, args ...any) {
+	l.t.Helper()
+	l.t.Logf("[WARN  +%6v] %s", time.Since(l.start).Round(time.Millisecond), fmt.Sprintf(format, args...))
+}
+
+// Todo marks a test as intentionally unimplemented.
+// Shows as SKIP [TODO] in output — never FAIL, always safe for CI.
+func (l *testLogger) Todo(feature string) {
+	l.t.Helper()
+	l.t.Skipf("[TODO ] %s", feature)
+}
+
+// ─── Client helpers ────────────────────────────────────────────────────────────
+
+// requireIntegrationClient returns a configured ADT client, or skips the test
+// if SAP_URL / SAP_USER / SAP_PASSWORD are not set.
+// Logs connection details so every test output shows which system was used.
+func requireIntegrationClient(t *testing.T) *Client {
+	t.Helper()
 	url := os.Getenv("SAP_URL")
 	user := os.Getenv("SAP_USER")
 	pass := os.Getenv("SAP_PASSWORD")
 
 	if url == "" || user == "" || pass == "" {
-		t.Skip("SAP_URL, SAP_USER, SAP_PASSWORD required for integration tests")
+		t.Skip("Integration tests require SAP_URL, SAP_USER, SAP_PASSWORD — see reports/2026-03-13-001-integration-testing-plan.md")
 	}
 
-	client := os.Getenv("SAP_CLIENT")
-	if client == "" {
-		client = "001"
+	sapClient := os.Getenv("SAP_CLIENT")
+	if sapClient == "" {
+		sapClient = "001"
 	}
 	lang := os.Getenv("SAP_LANGUAGE")
 	if lang == "" {
 		lang = "EN"
 	}
 
-	opts := []Option{
-		WithClient(client),
-		WithLanguage(lang),
-		WithTimeout(30 * time.Second),
-	}
+	log := newTestLogger(t)
+	log.Info("SAP connection: url=%s user=%s client=%s lang=%s", url, user, sapClient, lang)
 
+	opts := []Option{
+		WithClient(sapClient),
+		WithLanguage(lang),
+		WithTimeout(60 * time.Second), // 30s was too short for activate/ATC
+	}
 	if os.Getenv("SAP_INSECURE") == "true" {
 		opts = append(opts, WithInsecureSkipVerify())
 	}
 
 	return NewClient(url, user, pass, opts...)
+}
+
+// getIntegrationClient is a backward-compatible alias so existing tests compile unchanged.
+func getIntegrationClient(t *testing.T) *Client { return requireIntegrationClient(t) }
+
+// ─── Object helpers ────────────────────────────────────────────────────────────
+
+// tempObjectName returns a short unique name that won't collide across parallel runs.
+// Example: tempObjectName("ZTEST_PROG") → "ZTEST_PROG_42317"
+func tempObjectName(base string) string {
+	return fmt.Sprintf("%s_%05d", base, time.Now().Unix()%100000)
+}
+
+// withTempProgram creates a PROG/P in $TMP, calls fn with its ADT object URL,
+// then deletes it via t.Cleanup even if the test panics or fails.
+// Set SAP_TEST_NO_CLEANUP=true to keep the object for manual inspection.
+func withTempProgram(t *testing.T, client *Client, name, source string, fn func(objectURL string)) {
+	t.Helper()
+	ctx := context.Background()
+	log := newTestLogger(t)
+
+	err := client.CreateObject(ctx, CreateObjectOptions{
+		ObjectType:  ObjectTypeProgram,
+		Name:        name,
+		Description: "vsp integration test — safe to delete",
+		PackageName: "$TMP",
+	})
+	if err != nil {
+		t.Fatalf("withTempProgram: create %s: %v", name, err)
+	}
+	objectURL := GetObjectURL(ObjectTypeProgram, name, "")
+	log.Info("Created temp program: %s (%s)", name, objectURL)
+
+	if source != "" {
+		sourceURL := GetSourceURL(ObjectTypeProgram, name, "")
+		lock, err := client.LockObject(ctx, objectURL, "MODIFY")
+		if err != nil {
+			t.Fatalf("withTempProgram: lock %s for initial source: %v", name, err)
+		}
+		if err := client.UpdateSource(ctx, sourceURL, source, lock.LockHandle, ""); err != nil {
+			_ = client.UnlockObject(ctx, objectURL, lock.LockHandle)
+			t.Fatalf("withTempProgram: write source to %s: %v", name, err)
+		}
+		if err := client.UnlockObject(ctx, objectURL, lock.LockHandle); err != nil {
+			log.Warn("withTempProgram: unlock after source write: %v", err)
+		}
+		log.Debug("Wrote initial source to %s (%d chars)", name, len(source))
+	}
+
+	t.Cleanup(func() {
+		if os.Getenv("SAP_TEST_NO_CLEANUP") == "true" {
+			log.Warn("Cleanup skipped (SAP_TEST_NO_CLEANUP=true) — delete %s manually", name)
+			return
+		}
+		ctx2, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		lock, err := client.LockObject(ctx2, objectURL, "MODIFY")
+		if err != nil {
+			log.Warn("Cleanup: lock %s failed: %v", name, err)
+			return
+		}
+		if err := client.DeleteObject(ctx2, objectURL, lock.LockHandle, ""); err != nil {
+			log.Warn("Cleanup: delete %s failed: %v", name, err)
+		} else {
+			log.Info("Cleanup: deleted %s", name)
+		}
+	})
+
+	fn(objectURL)
 }
 
 func TestIntegration_SearchObject(t *testing.T) {
@@ -441,26 +576,32 @@ WRITE 'Hello from MCP!'.`
 	t.Log("CRUD workflow completed successfully!")
 }
 
-// TestIntegration_LockUnlock tests just the lock/unlock cycle
+// TestIntegration_LockUnlock tests just the lock/unlock cycle.
+// Uses a temporary $TMP program so we never touch standard SAP objects (B-004 fix).
 func TestIntegration_LockUnlock(t *testing.T) {
-	client := getIntegrationClient(t)
-	ctx := context.Background()
+	client := requireIntegrationClient(t)
+	log := newTestLogger(t)
 
-	// Try to lock a standard program (should exist in any system)
-	objectURL := "/sap/bc/adt/programs/programs/SAPMSSY0"
+	name := tempObjectName("ZTEST_LOCK")
+	withTempProgram(t, client, name, "", func(objectURL string) {
+		ctx := context.Background()
 
-	lock, err := client.LockObject(ctx, objectURL, "MODIFY")
-	if err != nil {
-		t.Skipf("Could not lock SAPMSSY0: %v", err)
-	}
-	t.Logf("Lock acquired: handle=%s, isLocal=%v", lock.LockHandle, lock.IsLocal)
+		lock, err := client.LockObject(ctx, objectURL, "MODIFY")
+		if err != nil {
+			t.Fatalf("LockObject failed: %v", err)
+		}
+		log.Info("Lock acquired: handle=%s isLocal=%v", lock.LockHandle, lock.IsLocal)
 
-	// Immediately unlock
-	err = client.UnlockObject(ctx, objectURL, lock.LockHandle)
-	if err != nil {
-		t.Fatalf("Failed to unlock: %v", err)
-	}
-	t.Log("Object unlocked successfully")
+		if lock.LockHandle == "" {
+			t.Error("LockHandle is empty")
+		}
+
+		err = client.UnlockObject(ctx, objectURL, lock.LockHandle)
+		if err != nil {
+			t.Fatalf("UnlockObject failed: %v", err)
+		}
+		log.Info("Unlock successful")
+	})
 }
 
 // TestIntegration_ClassWithUnitTests tests the full class + unit test workflow:
