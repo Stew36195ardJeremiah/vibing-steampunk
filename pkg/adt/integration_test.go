@@ -1877,82 +1877,93 @@ func TestIntegration_ExternalBreakpoints(t *testing.T) {
 }
 
 func TestIntegration_DebuggerListener(t *testing.T) {
-	client := getIntegrationClient(t)
-	ctx := context.Background()
+	client := requireIntegrationClient(t)
+	log := newTestLogger(t)
 
-	// Get the username from environment
 	testUser := os.Getenv("SAP_USER")
 	if testUser == "" {
-		testUser = "AVINOGRADOVA"
+		testUser = "DEVELOPER"
 	}
+	log.Info("Testing debug listener for user: %s", testUser)
 
-	t.Logf("Testing debug listener for user: %s", testUser)
+	// Step 1: Check for existing listeners (short timeout — read-only probe)
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer checkCancel()
 
-	// Step 1: Check if there are existing listeners
-	t.Log("Step 1: Checking for existing listeners...")
-	conflict, err := client.DebuggerCheckListener(ctx, &ListenOptions{
+	log.Info("Step 1: Checking for existing listeners...")
+	conflict, err := client.DebuggerCheckListener(checkCtx, &ListenOptions{
 		DebuggingMode: DebuggingModeUser,
 		User:          testUser,
 	})
 	if err != nil {
-		t.Logf("DebuggerCheckListener returned error: %v", err)
+		log.Warn("DebuggerCheckListener error: %v", err)
 	}
 	if conflict != nil {
-		t.Logf("Found existing listener: %s", conflict.ConflictText)
-		// Stop the existing listener first
-		t.Log("Stopping existing listener...")
-		err = client.DebuggerStopListener(ctx, &ListenOptions{
+		log.Info("Found existing listener: %s — stopping it first", conflict.ConflictText)
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		if stopErr := client.DebuggerStopListener(stopCtx, &ListenOptions{
 			DebuggingMode: DebuggingModeUser,
 			User:          testUser,
-		})
-		if err != nil {
-			t.Logf("Failed to stop existing listener: %v", err)
+		}); stopErr != nil {
+			log.Warn("DebuggerStopListener error: %v", stopErr)
 		}
 	} else {
-		t.Log("No existing listeners found")
+		log.Info("No existing listeners found")
 	}
 
-	// Step 2: Start a short listener (5 second timeout)
-	t.Log("Step 2: Starting debug listener with 5s timeout...")
-	result, err := client.DebuggerListen(ctx, &ListenOptions{
+	// Step 2: Start a short listen — SAP TimeoutSeconds=5 means the server
+	// returns after 5s with a "timed out" result. We give the HTTP call 20s
+	// so there's headroom for network + processing on both sides.
+	log.Info("Step 2: Starting debug listener (server timeout=5s, HTTP deadline=20s)...")
+	listenCtx, listenCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer listenCancel()
+
+	result, err := client.DebuggerListen(listenCtx, &ListenOptions{
 		DebuggingMode:  DebuggingModeUser,
 		User:           testUser,
-		TimeoutSeconds: 5, // Very short timeout for testing
+		TimeoutSeconds: 5,
 	})
 	if err != nil {
-		// The listener might error if there's a conflict or other issue
-		t.Logf("DebuggerListen returned error: %v", err)
+		// Context deadline or SAP error — log and skip (not a test failure;
+		// debugger API requires specific authorizations not guaranteed on trial).
+		log.Warn("DebuggerListen error: %v — skipping (debugger API may need special auth)", err)
 		if result != nil && result.Conflict != nil {
-			t.Logf("Conflict info: %s (ideUser: %s)",
-				result.Conflict.ConflictText,
-				result.Conflict.IdeUser)
+			log.Warn("Conflict: %s (ideUser: %s)", result.Conflict.ConflictText, result.Conflict.IdeUser)
 		}
-	} else if result != nil {
-		if result.TimedOut {
-			t.Log("Listener timed out (expected - no debuggee available)")
-		} else if result.Debuggee != nil {
-			t.Logf("Debuggee caught: ID=%s, Program=%s, Line=%d",
-				result.Debuggee.ID, result.Debuggee.Program, result.Debuggee.Line)
-		} else if result.Conflict != nil {
-			t.Logf("Conflict detected: %s", result.Conflict.ConflictText)
-		} else {
-			t.Log("Listener returned with no debuggee or timeout")
-		}
+		t.Skipf("DebuggerListen not available on this system: %v", err)
+		return
 	}
 
-	// Step 3: Stop listener (cleanup)
-	t.Log("Step 3: Stopping listener...")
-	err = client.DebuggerStopListener(ctx, &ListenOptions{
+	if result == nil {
+		t.Skip("DebuggerListen returned nil result — skipping")
+		return
+	}
+
+	switch {
+	case result.TimedOut:
+		log.Info("Listener timed out as expected (no debuggee attached)")
+	case result.Debuggee != nil:
+		log.Info("Debuggee caught: ID=%s Program=%s Line=%d",
+			result.Debuggee.ID, result.Debuggee.Program, result.Debuggee.Line)
+	case result.Conflict != nil:
+		log.Warn("Conflict detected: %s", result.Conflict.ConflictText)
+	default:
+		log.Warn("Listener returned with no debuggee, timeout, or conflict")
+	}
+
+	// Step 3: Stop listener (cleanup — best effort)
+	log.Info("Step 3: Stopping listener...")
+	stopCtx2, stopCancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer stopCancel2()
+	if stopErr := client.DebuggerStopListener(stopCtx2, &ListenOptions{
 		DebuggingMode: DebuggingModeUser,
 		User:          testUser,
-	})
-	if err != nil {
-		t.Logf("DebuggerStopListener returned error: %v (might be expected if already stopped)", err)
+	}); stopErr != nil {
+		log.Warn("DebuggerStopListener error (may already be stopped): %v", stopErr)
 	} else {
-		t.Log("Listener stopped successfully")
+		log.Info("Listener stopped")
 	}
-
-	t.Log("Debug listener test completed!")
 }
 
 // TestIntegration_DebugSessionAPIs tests the debug session APIs without a live debuggee.
