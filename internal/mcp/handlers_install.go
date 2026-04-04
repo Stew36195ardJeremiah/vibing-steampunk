@@ -396,9 +396,14 @@ func (s *Server) handleInstallZADTVSP(ctx context.Context, request mcp.CallToolR
 		}
 		err := s.adtClient.CreateObject(ctx, createOpts)
 		if err != nil {
-			return newToolResultError(fmt.Sprintf("Failed to create package: %v", err)), nil
+			// On older SAP releases (e.g. 7.40), /sap/bc/adt/packages may not exist.
+			// Don't abort — the package may have been pre-created via SE21/SE80,
+			// and WriteSource will fail with a clear error if it truly doesn't exist.
+			fmt.Fprintf(&sb, "  ⚠ Package creation failed: %v\n", err)
+			fmt.Fprintf(&sb, "  → Continuing anyway (package may already exist via SE21/SE80)\n\n")
+		} else {
+			fmt.Fprintf(&sb, "  ✓ Package %s created\n\n", packageName)
 		}
-		fmt.Fprintf(&sb, "  ✓ Package %s created\n\n", packageName)
 	} else {
 		fmt.Fprintf(&sb, "Using existing package %s\n\n", packageName)
 	}

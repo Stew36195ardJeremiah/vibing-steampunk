@@ -371,7 +371,7 @@ func (t *Transport) setDefaultHeaders(req *http.Request, opts *RequestOptions) {
 	switch t.config.SessionType {
 	case SessionStateful:
 		req.Header.Set("X-sap-adt-sessiontype", "stateful")
-	case SessionStateless:
+	default:
 		req.Header.Set("X-sap-adt-sessiontype", "stateless")
 	}
 }
@@ -447,7 +447,8 @@ func (e *APIError) IsSessionExpired() bool {
 	msg := strings.ToLower(e.Message)
 	return strings.Contains(msg, "icmenosession") ||
 		strings.Contains(msg, "session timed out") ||
-		strings.Contains(msg, "session no longer exists")
+		strings.Contains(msg, "session no longer exists") ||
+		strings.Contains(msg, "session not found")
 }
 
 // IsNotFoundError checks if an error is an API 404 Not Found error.
