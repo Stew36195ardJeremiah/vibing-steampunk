@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Slim reverse ref queries — ADT freestyle doesn't support OR with LIKE ([`f17cf04`](https://github.com/oisee/vibing-steampunk/commit/f17cf04b3cc7367ea3a839c990419d76f31c85b5))
 - Skip local-only JS and TS transpile fixtures in CI ([`b20293e`](https://github.com/oisee/vibing-steampunk/commit/b20293e641362dd424e9e4125c5000a826bd5f56))
 - GoReleaser v2.15 dropped changelog.use git-cliff ([`668b66a`](https://github.com/oisee/vibing-steampunk/commit/668b66adece571a37a73c58ea9432d831496f76c))
+- Goreleaser v2 uses changelog.disable not changelog.skip ([`a08f451`](https://github.com/oisee/vibing-steampunk/commit/a08f451c460b662ebfc6b1d0b718da6008cb1a16))
 
 
 ### Features
