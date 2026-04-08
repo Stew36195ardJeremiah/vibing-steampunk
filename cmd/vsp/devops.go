@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -281,7 +282,9 @@ func init() {
 	// Health flags
 	healthCmd.Flags().String("package", "", "Analyze an entire package")
 	healthCmd.Flags().Bool("fast", false, "Faster package snapshot: skip expensive checks like tests and boundary scan")
-	healthCmd.Flags().String("format", "text", "Output format: text or json")
+	healthCmd.Flags().Bool("details", false, "Show full details: failing test methods, ATC findings")
+	healthCmd.Flags().String("format", "text", "Output format: text, json, md, or html")
+	healthCmd.Flags().String("report", "", "Generate report file: md or html (writes to <package>.<ext>)")
 
 	// ATC flags
 	atcCmd.Flags().String("variant", "", "ATC check variant (empty for system default)")
@@ -654,9 +657,11 @@ type cliHealthSignal struct {
 }
 
 type cliHealthResult struct {
-	Scope   cliHealthScope              `json:"scope"`
-	Summary cliHealthSummary            `json:"summary"`
-	Signals map[string]cliHealthSignal  `json:"signals"`
+	Scope       cliHealthScope              `json:"scope"`
+	Summary     cliHealthSummary            `json:"summary"`
+	Signals     map[string]cliHealthSignal  `json:"signals"`
+	TestDetails *adt.UnitTestResult         `json:"testDetails,omitempty"`
+	ATCDetails  *adt.ATCWorklist            `json:"atcDetails,omitempty"`
 }
 
 func runHealth(cmd *cobra.Command, args []string) error {
@@ -671,8 +676,26 @@ func runHealth(cmd *cobra.Command, args []string) error {
 
 	packageName, _ := cmd.Flags().GetString("package")
 	fast, _ := cmd.Flags().GetBool("fast")
+	details, _ := cmd.Flags().GetBool("details")
 	format, _ := cmd.Flags().GetString("format")
+	report, _ := cmd.Flags().GetString("report")
 	packageName = strings.ToUpper(strings.TrimSpace(packageName))
+
+	// --report: either bare format ("md"/"html") or a filename ("report.md"/"out.html")
+	var reportFile string
+	if report != "" {
+		if strings.HasSuffix(report, ".md") {
+			format = "md"
+			reportFile = report
+		} else if strings.HasSuffix(report, ".html") {
+			format = "html"
+			reportFile = report
+		} else if report == "md" || report == "html" {
+			format = report
+		} else {
+			return fmt.Errorf("unsupported report format %q (want md, html, or filename ending in .md/.html)", report)
+		}
+	}
 
 	result := &cliHealthResult{Signals: make(map[string]cliHealthSignal)}
 
@@ -691,16 +714,52 @@ func runHealth(cmd *cobra.Command, args []string) error {
 
 	result.Summary = summarizeCLIHealth(result.Signals)
 
-	if format == "json" {
+	// --report: redirect output to file
+	if report != "" {
+		fileName := reportFile
+		if fileName == "" {
+			scopeName := packageName
+			if scopeName == "" {
+				scopeName = strings.ToUpper(args[0]) + "_" + strings.ToUpper(args[1])
+			}
+			fileName = strings.ReplaceAll(scopeName, "$", "") + "." + format
+		}
+		f, err := os.Create(fileName)
+		if err != nil {
+			return fmt.Errorf("creating report file: %w", err)
+		}
+		defer f.Close()
+		// Redirect stdout to the file for the print functions
+		origStdout := os.Stdout
+		os.Stdout = f
+		defer func() { os.Stdout = origStdout }()
+
+		switch format {
+		case "md":
+			printCLIHealthMD(result)
+		case "html":
+			printCLIHealthHTML(result)
+		}
+
+		os.Stdout = origStdout
+		fmt.Fprintf(os.Stderr, "Report saved to %s\n", fileName)
+		return nil
+	}
+
+	switch format {
+	case "json":
 		data, err := json.MarshalIndent(result, "", "  ")
 		if err != nil {
 			return err
 		}
 		fmt.Println(string(data))
-		return nil
+	case "md":
+		printCLIHealthMD(result)
+	case "html":
+		printCLIHealthHTML(result)
+	default:
+		printCLIHealth(result, details)
 	}
-
-	printCLIHealth(result)
 	return nil
 }
 
@@ -710,7 +769,9 @@ func populatePackageHealthCLI(ctx context.Context, client *adt.Client, pkg strin
 		result.Signals["boundaries"] = cliHealthSignal{Status: "SKIPPED", Details: map[string]any{"reason": "fast mode"}}
 	} else {
 		fmt.Fprintf(os.Stderr, "  [1/4] Running tests...\n")
-		result.Signals["tests"] = collectPackageTestsCLI(ctx, client, pkg)
+		testSignal, testDetails := collectPackageTestsWithDetails(ctx, client, pkg)
+		result.Signals["tests"] = testSignal
+		result.TestDetails = testDetails
 		fmt.Fprintf(os.Stderr, "  [2/4] Checking boundaries...\n")
 		result.Signals["boundaries"] = collectPackageBoundariesCLI(ctx, client, pkg)
 	}
@@ -719,7 +780,9 @@ func populatePackageHealthCLI(ctx context.Context, client *adt.Client, pkg strin
 		step = 1
 	}
 	fmt.Fprintf(os.Stderr, "  [%d/%d] Running ATC...\n", step, step+1)
-	result.Signals["atc"] = collectPackageATCCLI(ctx, client, pkg)
+	atcSignal, atcDetails := collectPackageATCWithDetails(ctx, client, pkg)
+	result.Signals["atc"] = atcSignal
+	result.ATCDetails = atcDetails
 	fmt.Fprintf(os.Stderr, "  [%d/%d] Checking staleness...\n", step+1, step+1)
 	result.Signals["staleness"] = collectPackageStalenessCLI(ctx, client, pkg)
 }
@@ -751,12 +814,12 @@ func collectObjectTestsCLI(ctx context.Context, client *adt.Client, objType, obj
 	return cliHealthSignal{Status: status, Details: map[string]any{"classes": classes, "methods": methods, "alerts": alerts}}
 }
 
-func collectPackageTestsCLI(ctx context.Context, client *adt.Client, pkg string) cliHealthSignal {
+func collectPackageTestsWithDetails(ctx context.Context, client *adt.Client, pkg string) (cliHealthSignal, *adt.UnitTestResult) {
 	// Resolve full package hierarchy (TDEVC + prefix fallback) — same as slim/changelog.
 	// SAP's test runner only covers the exact package, not subpackages.
 	scope, err := AcquirePackageScope(ctx, client, pkg, true)
 	if err != nil {
-		return cliHealthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}
+		return cliHealthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}, nil
 	}
 
 	packages := scope.Packages
@@ -764,6 +827,7 @@ func collectPackageTestsCLI(ctx context.Context, client *adt.Client, pkg string)
 		packages = []string{strings.ToUpper(pkg)}
 	}
 
+	combined := &adt.UnitTestResult{}
 	totalClasses, totalMethods, totalAlerts := 0, 0, 0
 	for _, p := range packages {
 		objectURL := fmt.Sprintf("/sap/bc/adt/packages/%s", p)
@@ -771,6 +835,7 @@ func collectPackageTestsCLI(ctx context.Context, client *adt.Client, pkg string)
 		if err != nil {
 			continue
 		}
+		combined.Classes = append(combined.Classes, result.Classes...)
 		c, m, a := summarizeUnitTestsCLI(result)
 		totalClasses += c
 		totalMethods += m
@@ -785,11 +850,11 @@ func collectPackageTestsCLI(ctx context.Context, client *adt.Client, pkg string)
 		status = "FAIL"
 	}
 	return cliHealthSignal{Status: status, Details: map[string]any{
-		"packages_scanned":   len(packages),
-		"classes":            totalClasses,
-		"methods":            totalMethods,
-		"alerts":             totalAlerts,
-	}}
+		"packages_scanned": len(packages),
+		"classes":          totalClasses,
+		"methods":          totalMethods,
+		"alerts":           totalAlerts,
+	}}, combined
 }
 
 func summarizeUnitTestsCLI(result *adt.UnitTestResult) (classCount, methodCount, alertCount int) {
@@ -824,18 +889,18 @@ func collectObjectATCCLI(ctx context.Context, client *adt.Client, objType, objNa
 	return cliHealthSignal{Status: status, Details: map[string]any{"findings": total, "errors": errors, "warnings": warnings, "infos": infos}}
 }
 
-func collectPackageATCCLI(ctx context.Context, client *adt.Client, pkg string) cliHealthSignal {
+func collectPackageATCWithDetails(ctx context.Context, client *adt.Client, pkg string) (cliHealthSignal, *adt.ATCWorklist) {
 	objectURL := fmt.Sprintf("/sap/bc/adt/packages/%s", strings.ToUpper(pkg))
 	result, err := client.RunATCCheck(ctx, objectURL, "", 200)
 	if err != nil {
-		return cliHealthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}
+		return cliHealthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}, nil
 	}
 	total, errors, warnings, infos := summarizeATCCLI(result)
 	status := "CLEAN"
 	if total > 0 {
 		status = "FINDINGS"
 	}
-	return cliHealthSignal{Status: status, Details: map[string]any{"findings": total, "errors": errors, "warnings": warnings, "infos": infos}}
+	return cliHealthSignal{Status: status, Details: map[string]any{"findings": total, "errors": errors, "warnings": warnings, "infos": infos}}, result
 }
 
 func summarizeATCCLI(result *adt.ATCWorklist) (total, errors, warnings, infos int) {
@@ -1026,7 +1091,7 @@ func summarizeCLIHealth(signals map[string]cliHealthSignal) cliHealthSummary {
 	return cliHealthSummary{Status: "GOOD", Headline: "No major health issues detected"}
 }
 
-func printCLIHealth(result *cliHealthResult) {
+func printCLIHealth(result *cliHealthResult, details bool) {
 	switch result.Scope.Kind {
 	case "package":
 		fmt.Printf("Health: package %s\n", result.Scope.Package)
@@ -1046,6 +1111,230 @@ func printCLIHealth(result *cliHealthResult) {
 		}
 		fmt.Println()
 	}
+
+	if !details {
+		return
+	}
+
+	// Detailed test results
+	if result.TestDetails != nil && len(result.TestDetails.Classes) > 0 {
+		fmt.Printf("\n--- Test Details ---\n\n")
+		for _, class := range result.TestDetails.Classes {
+			fmt.Printf("  %s\n", class.Name)
+			for _, method := range class.TestMethods {
+				status := "PASS"
+				if len(method.Alerts) > 0 {
+					status = "FAIL"
+				}
+				fmt.Printf("    %-4s  %s (%.3fs)\n", status, method.Name, method.ExecutionTime)
+				for _, alert := range method.Alerts {
+					fmt.Printf("          %s: %s\n", alert.Kind, alert.Title)
+					for _, d := range alert.Details {
+						fmt.Printf("            %s\n", d)
+					}
+				}
+			}
+			for _, alert := range class.Alerts {
+				fmt.Printf("    ALERT %s: %s\n", alert.Kind, alert.Title)
+			}
+		}
+	}
+
+	// Detailed ATC findings
+	if result.ATCDetails != nil && len(result.ATCDetails.Objects) > 0 {
+		fmt.Printf("\n--- ATC Findings ---\n\n")
+		for _, obj := range result.ATCDetails.Objects {
+			if len(obj.Findings) == 0 {
+				continue
+			}
+			fmt.Printf("  %s %s (%d findings)\n", obj.Type, obj.Name, len(obj.Findings))
+			for _, f := range obj.Findings {
+				prio := "INFO"
+				switch f.Priority {
+				case 1:
+					prio = "ERROR"
+				case 2:
+					prio = "WARN"
+				}
+				fmt.Printf("    %-5s  %s — %s\n", prio, f.CheckTitle, f.MessageTitle)
+			}
+		}
+	}
+}
+
+func printCLIHealthMD(result *cliHealthResult) {
+	scope := result.Scope.Package
+	if scope == "" {
+		scope = result.Scope.ObjectType + " " + result.Scope.ObjectName
+	}
+	fmt.Printf("# Health Report: %s\n\n", scope)
+	fmt.Printf("**%s** — %s\n\n", result.Summary.Status, result.Summary.Headline)
+
+	fmt.Println("## Signals\n")
+	fmt.Println("| Signal | Status | Details |")
+	fmt.Println("|--------|--------|---------|")
+	for _, key := range []string{"tests", "atc", "boundaries", "staleness"} {
+		sig, ok := result.Signals[key]
+		if !ok {
+			continue
+		}
+		detailStr := ""
+		if len(sig.Details) > 0 {
+			parts := make([]string, 0, len(sig.Details))
+			for k, v := range sig.Details {
+				parts = append(parts, fmt.Sprintf("%s: %v", k, v))
+			}
+			sort.Strings(parts)
+			detailStr = strings.Join(parts, ", ")
+		}
+		fmt.Printf("| %s | %s | %s |\n", key, sig.Status, detailStr)
+	}
+
+	if result.TestDetails != nil && len(result.TestDetails.Classes) > 0 {
+		fmt.Println("\n## Test Details\n")
+		for _, class := range result.TestDetails.Classes {
+			fmt.Printf("### %s\n\n", class.Name)
+			fmt.Println("| Method | Status | Time | Details |")
+			fmt.Println("|--------|--------|------|---------|")
+			for _, method := range class.TestMethods {
+				status := "PASS"
+				detail := ""
+				if len(method.Alerts) > 0 {
+					status = "FAIL"
+					titles := make([]string, 0, len(method.Alerts))
+					for _, a := range method.Alerts {
+						titles = append(titles, a.Title)
+					}
+					detail = strings.Join(titles, "; ")
+				}
+				fmt.Printf("| %s | %s | %.3fs | %s |\n", method.Name, status, method.ExecutionTime, detail)
+			}
+			fmt.Println()
+		}
+	}
+
+	if result.ATCDetails != nil && len(result.ATCDetails.Objects) > 0 {
+		fmt.Println("\n## ATC Findings\n")
+		for _, obj := range result.ATCDetails.Objects {
+			if len(obj.Findings) == 0 {
+				continue
+			}
+			fmt.Printf("### %s %s\n\n", obj.Type, obj.Name)
+			fmt.Println("| Priority | Check | Message |")
+			fmt.Println("|----------|-------|---------|")
+			for _, f := range obj.Findings {
+				prio := "Info"
+				switch f.Priority {
+				case 1:
+					prio = "Error"
+				case 2:
+					prio = "Warning"
+				}
+				fmt.Printf("| %s | %s | %s |\n", prio, f.CheckTitle, f.MessageTitle)
+			}
+			fmt.Println()
+		}
+	}
+}
+
+func printCLIHealthHTML(result *cliHealthResult) {
+	scope := result.Scope.Package
+	if scope == "" {
+		scope = result.Scope.ObjectType + " " + result.Scope.ObjectName
+	}
+
+	fmt.Println(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<title>Health Report</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; color: #333; }
+  h1 { border-bottom: 2px solid #ddd; padding-bottom: 0.3em; }
+  h2 { margin-top: 1.5em; color: #555; }
+  h3 { color: #666; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+  th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+  th { background: #f5f5f5; }
+  .PASS, .CLEAN, .GOOD { color: #2e7d32; }
+  .FAIL, .BAD, .ERROR { color: #c62828; }
+  .WARN, .FINDINGS { color: #ef6c00; }
+  .NONE, .UNKNOWN, .SKIPPED { color: #757575; }
+  .prio-error { color: #c62828; font-weight: bold; }
+  .prio-warn { color: #ef6c00; }
+  .prio-info { color: #1565c0; }
+</style>
+</head><body>`)
+
+	fmt.Printf("<h1>Health Report: %s</h1>\n", scope)
+	fmt.Printf("<p><strong class=%q>%s</strong> — %s</p>\n", result.Summary.Status, result.Summary.Status, result.Summary.Headline)
+
+	fmt.Println("<h2>Signals</h2>")
+	fmt.Println("<table><tr><th>Signal</th><th>Status</th><th>Details</th></tr>")
+	for _, key := range []string{"tests", "atc", "boundaries", "staleness"} {
+		sig, ok := result.Signals[key]
+		if !ok {
+			continue
+		}
+		detailStr := ""
+		if len(sig.Details) > 0 {
+			parts := make([]string, 0, len(sig.Details))
+			for k, v := range sig.Details {
+				parts = append(parts, fmt.Sprintf("%s: %v", k, v))
+			}
+			sort.Strings(parts)
+			detailStr = strings.Join(parts, ", ")
+		}
+		fmt.Printf("<tr><td>%s</td><td class=%q>%s</td><td>%s</td></tr>\n", key, sig.Status, sig.Status, detailStr)
+	}
+	fmt.Println("</table>")
+
+	if result.TestDetails != nil && len(result.TestDetails.Classes) > 0 {
+		fmt.Println("<h2>Test Details</h2>")
+		for _, class := range result.TestDetails.Classes {
+			fmt.Printf("<h3>%s</h3>\n", class.Name)
+			fmt.Println("<table><tr><th>Method</th><th>Status</th><th>Time</th><th>Details</th></tr>")
+			for _, method := range class.TestMethods {
+				status := "PASS"
+				detail := ""
+				if len(method.Alerts) > 0 {
+					status = "FAIL"
+					titles := make([]string, 0, len(method.Alerts))
+					for _, a := range method.Alerts {
+						titles = append(titles, a.Title)
+					}
+					detail = strings.Join(titles, "; ")
+				}
+				fmt.Printf("<tr><td>%s</td><td class=%q>%s</td><td>%.3fs</td><td>%s</td></tr>\n", method.Name, status, status, method.ExecutionTime, detail)
+			}
+			fmt.Println("</table>")
+		}
+	}
+
+	if result.ATCDetails != nil && len(result.ATCDetails.Objects) > 0 {
+		fmt.Println("<h2>ATC Findings</h2>")
+		for _, obj := range result.ATCDetails.Objects {
+			if len(obj.Findings) == 0 {
+				continue
+			}
+			fmt.Printf("<h3>%s %s (%d findings)</h3>\n", obj.Type, obj.Name, len(obj.Findings))
+			fmt.Println("<table><tr><th>Priority</th><th>Check</th><th>Message</th></tr>")
+			for _, f := range obj.Findings {
+				prio := "Info"
+				prioClass := "prio-info"
+				switch f.Priority {
+				case 1:
+					prio = "Error"
+					prioClass = "prio-error"
+				case 2:
+					prio = "Warning"
+					prioClass = "prio-warn"
+				}
+				fmt.Printf("<tr><td class=%q>%s</td><td>%s</td><td>%s</td></tr>\n", prioClass, prio, f.CheckTitle, f.MessageTitle)
+			}
+			fmt.Println("</table>")
+		}
+	}
+
+	fmt.Println("</body></html>")
 }
 
 func resolvePackagesCLI(ctx context.Context, client *adt.Client, g *graph.Graph) {
