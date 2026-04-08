@@ -132,6 +132,182 @@ Examples:
 	RunE: runHealth,
 }
 
+func runBoundaries(cmd *cobra.Command, args []string) error {
+	params, err := resolveSystemParams(cmd)
+	if err != nil {
+		return err
+	}
+	client, err := getClient(params)
+	if err != nil {
+		return err
+	}
+
+	pkg := strings.ToUpper(strings.TrimSpace(args[0]))
+	format, _ := cmd.Flags().GetString("format")
+	report, _ := cmd.Flags().GetString("report")
+	exact, _ := cmd.Flags().GetBool("exact")
+	ctx := context.Background()
+
+	// Resolve scope
+	scope, err := AcquirePackageScope(ctx, client, pkg, !exact)
+	if err != nil {
+		return fmt.Errorf("scope resolution failed: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Analyzing boundaries for %s (%d packages in scope)...\n", pkg, len(scope.Packages))
+
+	// Collect objects
+	objects, err := AcquirePackageObjects(ctx, client, ScopeToWhere(scope))
+	if err != nil {
+		return err
+	}
+	if len(objects) == 0 {
+		return fmt.Errorf("package %s is empty or not found", pkg)
+	}
+
+	// Build graph
+	g := graph.New()
+	count := 0
+	for _, obj := range objects {
+		if !IsSourceBearing(obj.Type) {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "\r  [%d] %s %s", count+1, obj.Type, obj.Name)
+		source, err := client.GetSource(ctx, obj.Type, obj.Name, nil)
+		if err != nil || source == "" {
+			continue
+		}
+		nodeID := graph.NodeID(obj.Type, obj.Name)
+		g.AddNode(&graph.Node{ID: nodeID, Name: obj.Name, Type: obj.Type, Package: obj.Package})
+		edges := graph.ExtractDepsFromSource(source, nodeID)
+		dynEdges := graph.ExtractDynamicCalls(source, nodeID)
+		for _, e := range append(edges, dynEdges...) {
+			g.AddEdge(e)
+			parts := strings.SplitN(e.To, ":", 2)
+			if len(parts) == 2 {
+				g.AddNode(&graph.Node{ID: e.To, Name: parts[1], Type: parts[0]})
+			}
+		}
+		count++
+	}
+	if count > 0 {
+		fmt.Fprintf(os.Stderr, "\n")
+	}
+	fmt.Fprintf(os.Stderr, "Resolving target packages...\n")
+	resolvePackagesCLI(ctx, client, g)
+
+	// Analyze crossings
+	crossReport := graph.AnalyzeCrossings(g, scope, nil)
+
+	// Handle --report flag
+	if report != "" {
+		if strings.HasSuffix(report, ".md") {
+			format = "md"
+		} else if report == "md" {
+			format = "md"
+			report = strings.ReplaceAll(pkg, "$", "_") + "_boundaries.md"
+		} else {
+			return fmt.Errorf("unsupported report format %q (want md or filename.md)", report)
+		}
+		f, err := os.Create(report)
+		if err != nil {
+			return fmt.Errorf("creating report file: %w", err)
+		}
+		defer f.Close()
+		origStdout := os.Stdout
+		os.Stdout = f
+		printCrossingsMD(crossReport)
+		os.Stdout = origStdout
+		fmt.Fprintf(os.Stderr, "Report saved to %s\n", report)
+		return nil
+	}
+
+	switch format {
+	case "json":
+		data, err := json.MarshalIndent(crossReport, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+	case "md":
+		printCrossingsMD(crossReport)
+	default:
+		printCrossingsText(crossReport)
+	}
+	return nil
+}
+
+func printCrossingsText(report *graph.CrossingReport) {
+	fmt.Printf("Boundaries: %s (%d packages, %d objects scanned)\n\n",
+		report.RootPackage, report.PackagesScanned, report.ObjectsScanned)
+
+	if len(report.Entries) == 0 {
+		fmt.Println("No crossings found.")
+		return
+	}
+
+	dirOrder := []graph.CrossingDirection{
+		graph.CrossSibling, graph.CrossDownward, graph.CrossCommonDown,
+		graph.CrossExternal, graph.CrossUpward, graph.CrossUpwardSkip, graph.CrossCommon,
+	}
+	for _, dir := range dirOrder {
+		var entries []graph.CrossingEntry
+		for _, e := range report.Entries {
+			if e.Direction == dir {
+				entries = append(entries, e)
+			}
+		}
+		if len(entries) == 0 {
+			continue
+		}
+		marker := "OK  "
+		if dir == graph.CrossSibling || dir == graph.CrossDownward || dir == graph.CrossCommonDown {
+			marker = "BAD "
+		}
+		if dir == graph.CrossExternal {
+			marker = "INFO"
+		}
+		fmt.Printf("  %s  %-12s %d\n", marker, dir, len(entries))
+		for _, e := range entries {
+			fmt.Printf("         %s → %s  (%s → %s)\n",
+				e.SourcePackage, e.TargetPackage, e.SourceObject, e.TargetObject)
+		}
+		fmt.Println()
+	}
+
+	if len(report.Circular) > 0 {
+		fmt.Println("  CIRCULAR:")
+		for _, c := range report.Circular {
+			fmt.Printf("    %s\n", c)
+		}
+		fmt.Println()
+	}
+
+	bad := report.Sibling + report.Downward + report.CommonDown
+	if bad == 0 && len(report.Circular) == 0 {
+		fmt.Println("CLEAN — no directional violations")
+	} else {
+		fmt.Printf("%d violations (sibling: %d, downward: %d, common_down: %d)\n",
+			bad, report.Sibling, report.Downward, report.CommonDown)
+	}
+}
+
+var boundariesCmd = &cobra.Command{
+	Use:   "boundaries <package>",
+	Short: "Analyze directional package boundary crossings",
+	Long: `Analyze cross-package dependencies with directional classification.
+
+Directions: UPWARD (ok), COMMON (ok), SIBLING (bad), DOWNWARD (bad),
+COMMON_DOWN (bad), EXTERNAL (info). Detects circular sibling dependencies.
+
+Examples:
+  vsp boundaries '$ZDEV'
+  vsp boundaries '$ZDEV' --format json
+  vsp boundaries '$ZDEV' --report md
+  vsp boundaries '$ZDEV' --exact`,
+	Args: cobra.ExactArgs(1),
+	RunE: runBoundaries,
+}
+
 // --- deploy command ---
 
 var deployCmd = &cobra.Command{
@@ -314,6 +490,10 @@ func init() {
 	rootCmd.AddCommand(testCmd)
 	rootCmd.AddCommand(atcCmd)
 	rootCmd.AddCommand(healthCmd)
+	boundariesCmd.Flags().String("format", "text", "Output format: text, json, or md")
+	boundariesCmd.Flags().String("report", "", "Save report to file: md or filename.md")
+	boundariesCmd.Flags().Bool("exact", false, "Check only the exact package, no subpackages")
+	rootCmd.AddCommand(boundariesCmd)
 	rootCmd.AddCommand(deployCmd)
 	rootCmd.AddCommand(transportCmd)
 	rootCmd.AddCommand(contextCmd)
@@ -657,11 +837,12 @@ type cliHealthSignal struct {
 }
 
 type cliHealthResult struct {
-	Scope       cliHealthScope              `json:"scope"`
-	Summary     cliHealthSummary            `json:"summary"`
-	Signals     map[string]cliHealthSignal  `json:"signals"`
-	TestDetails *adt.UnitTestResult         `json:"testDetails,omitempty"`
-	ATCDetails  *adt.ATCWorklist            `json:"atcDetails,omitempty"`
+	Scope            cliHealthScope              `json:"scope"`
+	Summary          cliHealthSummary            `json:"summary"`
+	Signals          map[string]cliHealthSignal  `json:"signals"`
+	TestDetails      *adt.UnitTestResult         `json:"testDetails,omitempty"`
+	ATCDetails       *adt.ATCWorklist            `json:"atcDetails,omitempty"`
+	CrossingDetails  *graph.CrossingReport       `json:"crossingDetails,omitempty"`
 }
 
 func runHealth(cmd *cobra.Command, args []string) error {
@@ -773,7 +954,9 @@ func populatePackageHealthCLI(ctx context.Context, client *adt.Client, pkg strin
 		result.Signals["tests"] = testSignal
 		result.TestDetails = testDetails
 		fmt.Fprintf(os.Stderr, "  [2/4] Checking boundaries...\n")
-		result.Signals["boundaries"] = collectPackageBoundariesCLI(ctx, client, pkg)
+		boundarySignal, crossingReport := collectPackageBoundariesWithDetails(ctx, client, pkg)
+		result.Signals["boundaries"] = boundarySignal
+		result.CrossingDetails = crossingReport
 	}
 	step := 3
 	if fast {
@@ -956,17 +1139,17 @@ func collectObjectBoundariesCLI(ctx context.Context, client *adt.Client, objType
 	return cliHealthSignal{Status: status, Details: map[string]any{"violations": report.Violations, "crossed_packages": report.CrossedPackages, "dynamic": report.Dynamic}}
 }
 
-func collectPackageBoundariesCLI(ctx context.Context, client *adt.Client, pkg string) cliHealthSignal {
+func collectPackageBoundariesWithDetails(ctx context.Context, client *adt.Client, pkg string) (cliHealthSignal, *graph.CrossingReport) {
 	// Resolve full package hierarchy
 	scope, err := AcquirePackageScope(ctx, client, pkg, true)
 	if err != nil {
-		return cliHealthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}
+		return cliHealthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}, nil
 	}
 
 	// Collect objects from all packages in scope
 	objects, err := AcquirePackageObjects(ctx, client, ScopeToWhere(scope))
 	if err != nil {
-		return cliHealthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}
+		return cliHealthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}, nil
 	}
 
 	g := graph.New()
@@ -978,6 +1161,7 @@ func collectPackageBoundariesCLI(ctx context.Context, client *adt.Client, pkg st
 		if count >= 50 {
 			break
 		}
+		fmt.Fprintf(os.Stderr, "\r    [%d] %s %s", count+1, obj.Type, obj.Name)
 		source, err := client.GetSource(ctx, obj.Type, obj.Name, nil)
 		if err != nil || source == "" {
 			continue
@@ -995,6 +1179,9 @@ func collectPackageBoundariesCLI(ctx context.Context, client *adt.Client, pkg st
 		}
 		count++
 	}
+	if count > 0 {
+		fmt.Fprintf(os.Stderr, "\r")
+	}
 
 	// Resolve packages for target nodes
 	resolvePackagesCLI(ctx, client, g)
@@ -1003,16 +1190,13 @@ func collectPackageBoundariesCLI(ctx context.Context, client *adt.Client, pkg st
 	report := graph.AnalyzeCrossings(g, scope, nil)
 
 	status := "CLEAN"
-	if report.Sibling > 0 || report.Downward > 0 || report.CommonDown > 0 {
-		status = "VIOLATIONS"
-	}
-	if len(report.Circular) > 0 {
+	if report.Sibling > 0 || report.Downward > 0 || report.CommonDown > 0 || len(report.Circular) > 0 {
 		status = "VIOLATIONS"
 	}
 
 	details := map[string]any{
 		"packages_scanned": report.PackagesScanned,
-		"objects_scanned":  report.ObjectsScanned,
+		"objects_scanned":  count,
 	}
 	if report.Upward > 0 {
 		details["upward"] = report.Upward
@@ -1038,7 +1222,7 @@ func collectPackageBoundariesCLI(ctx context.Context, client *adt.Client, pkg st
 	if len(report.Circular) > 0 {
 		details["circular"] = report.Circular
 	}
-	return cliHealthSignal{Status: status, Details: details}
+	return cliHealthSignal{Status: status, Details: details}, report
 }
 
 func collectObjectStalenessCLI(ctx context.Context, client *adt.Client, objType, objName string) cliHealthSignal {
@@ -1217,6 +1401,44 @@ func printCLIHealth(result *cliHealthResult, details bool) {
 			}
 		}
 	}
+
+	// Detailed crossing entries
+	if result.CrossingDetails != nil && len(result.CrossingDetails.Entries) > 0 {
+		fmt.Printf("\n--- Boundary Crossings ---\n\n")
+
+		// Group by direction, show violations first
+		dirOrder := []graph.CrossingDirection{
+			graph.CrossSibling, graph.CrossDownward, graph.CrossCommonDown,
+			graph.CrossExternal, graph.CrossUpward, graph.CrossUpwardSkip, graph.CrossCommon,
+		}
+		for _, dir := range dirOrder {
+			var entries []graph.CrossingEntry
+			for _, e := range result.CrossingDetails.Entries {
+				if e.Direction == dir {
+					entries = append(entries, e)
+				}
+			}
+			if len(entries) == 0 {
+				continue
+			}
+			marker := "OK"
+			if dir == graph.CrossSibling || dir == graph.CrossDownward || dir == graph.CrossCommonDown {
+				marker = "BAD"
+			}
+			fmt.Printf("  %s  %s (%d)\n", marker, dir, len(entries))
+			for _, e := range entries {
+				fmt.Printf("    %s → %s  (%s.%s → %s)\n",
+					e.SourcePackage, e.TargetPackage, e.SourcePackage, e.SourceObject, e.TargetObject)
+			}
+		}
+
+		if len(result.CrossingDetails.Circular) > 0 {
+			fmt.Printf("\n  CIRCULAR dependencies:\n")
+			for _, c := range result.CrossingDetails.Circular {
+				fmt.Printf("    %s\n", c)
+			}
+		}
+	}
 }
 
 type testGroup struct {
@@ -1333,6 +1555,50 @@ func printCLIHealthMD(result *cliHealthResult) {
 			fmt.Println()
 		}
 	}
+
+	printCrossingsMD(result.CrossingDetails)
+}
+
+func printCrossingsMD(report *graph.CrossingReport) {
+	if report == nil || len(report.Entries) == 0 {
+		return
+	}
+	fmt.Println("\n## Boundary Crossings\n")
+
+	dirOrder := []graph.CrossingDirection{
+		graph.CrossSibling, graph.CrossDownward, graph.CrossCommonDown,
+		graph.CrossExternal, graph.CrossUpward, graph.CrossUpwardSkip, graph.CrossCommon,
+	}
+	for _, dir := range dirOrder {
+		var entries []graph.CrossingEntry
+		for _, e := range report.Entries {
+			if e.Direction == dir {
+				entries = append(entries, e)
+			}
+		}
+		if len(entries) == 0 {
+			continue
+		}
+		verdict := "OK"
+		if dir == graph.CrossSibling || dir == graph.CrossDownward || dir == graph.CrossCommonDown {
+			verdict = "BAD"
+		}
+		fmt.Printf("### %s — %s (%d)\n\n", dir, verdict, len(entries))
+		fmt.Println("| Source Package | Target Package | Source Object | Target Object |")
+		fmt.Println("|---------------|----------------|---------------|---------------|")
+		for _, e := range entries {
+			fmt.Printf("| %s | %s | %s | %s |\n", e.SourcePackage, e.TargetPackage, e.SourceObject, e.TargetObject)
+		}
+		fmt.Println()
+	}
+
+	if len(report.Circular) > 0 {
+		fmt.Println("### Circular Dependencies\n")
+		for _, c := range report.Circular {
+			fmt.Printf("- %s\n", c)
+		}
+		fmt.Println()
+	}
 }
 
 func printCLIHealthHTML(result *cliHealthResult) {
@@ -1440,6 +1706,44 @@ func printCLIHealthHTML(result *cliHealthResult) {
 				fmt.Printf("<tr><td class=%q>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n", prioClass, prio, f.CheckTitle, f.MessageTitle, f.Location)
 			}
 			fmt.Println("</table>")
+		}
+	}
+
+	// Crossing details
+	if result.CrossingDetails != nil && len(result.CrossingDetails.Entries) > 0 {
+		fmt.Println("<h2>Boundary Crossings</h2>")
+		dirOrder := []graph.CrossingDirection{
+			graph.CrossSibling, graph.CrossDownward, graph.CrossCommonDown,
+			graph.CrossExternal, graph.CrossUpward, graph.CrossUpwardSkip, graph.CrossCommon,
+		}
+		for _, dir := range dirOrder {
+			var entries []graph.CrossingEntry
+			for _, e := range result.CrossingDetails.Entries {
+				if e.Direction == dir {
+					entries = append(entries, e)
+				}
+			}
+			if len(entries) == 0 {
+				continue
+			}
+			cssClass := "PASS"
+			if dir == graph.CrossSibling || dir == graph.CrossDownward || dir == graph.CrossCommonDown {
+				cssClass = "FAIL"
+			}
+			fmt.Printf("<h3 class=%q>%s (%d)</h3>\n", cssClass, dir, len(entries))
+			fmt.Println("<table><tr><th>Source Pkg</th><th>Target Pkg</th><th>Source Object</th><th>Target Object</th></tr>")
+			for _, e := range entries {
+				fmt.Printf("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n",
+					e.SourcePackage, e.TargetPackage, e.SourceObject, e.TargetObject)
+			}
+			fmt.Println("</table>")
+		}
+		if len(result.CrossingDetails.Circular) > 0 {
+			fmt.Println("<h3 class=\"FAIL\">Circular Dependencies</h3><ul>")
+			for _, c := range result.CrossingDetails.Circular {
+				fmt.Printf("<li>%s</li>\n", c)
+			}
+			fmt.Println("</ul>")
 		}
 	}
 
