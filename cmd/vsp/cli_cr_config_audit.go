@@ -44,6 +44,8 @@ func init() {
 	crConfigAuditCmd.Flags().Bool("details", false, "Show every code reference and every customizing row")
 	crConfigAuditCmd.Flags().String("format", "text", "Output format: text, json, md, or html")
 	crConfigAuditCmd.Flags().String("report", "", "Write report to file: html, md, json, or filename.{html,md,json}")
+	crConfigAuditCmd.Flags().String("cache", "", "Path to sqlite cache file (default: /tmp/vsp-audit-cache-<system>.db)")
+	crConfigAuditCmd.Flags().Bool("no-cache", false, "Disable the persistent DDIC cache for this run")
 	rootCmd.AddCommand(crConfigAuditCmd)
 }
 
@@ -65,6 +67,20 @@ func runCRConfigAudit(cmd *cobra.Command, args []string) error {
 
 	ctx := context.Background()
 
+	// Open the DDIC cache unless the user disabled it. Failure to open is
+	// non-fatal — we just run without a warm cache and log the reason.
+	var cache *auditCache
+	if noCache, _ := cmd.Flags().GetBool("no-cache"); !noCache {
+		cachePath, _ := cmd.Flags().GetString("cache")
+		c, err := openAuditCache(params.Name, cachePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  [cache warn] %v — running without cache\n", err)
+		} else {
+			cache = c
+			defer cache.Close()
+		}
+	}
+
 	trList, err := resolveCRTransports(ctx, client, crID, attr)
 	if err != nil {
 		return err
@@ -83,7 +99,7 @@ func runCRConfigAudit(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "Split: %d workbench, %d customizing, %d other\n",
 		len(split.WorkbenchTRs), len(split.CustomizingTRs), len(split.OtherTRs))
 
-	codeTables, deletedRefs, err := collectCodeTables(ctx, client, split.WorkbenchTRs)
+	codeTables, deletedRefs, err := collectCodeTables(ctx, client, split.WorkbenchTRs, cache)
 	if err != nil {
 		return err
 	}
@@ -112,7 +128,7 @@ func runCRConfigAudit(cmd *cobra.Command, args []string) error {
 	for t := range custTables {
 		allTablesInScope[t] = true
 	}
-	reachable, err := walkDDICMetadata(ctx, client, allTablesInScope)
+	reachable, err := walkDDICMetadata(ctx, client, allTablesInScope, cache)
 	if err != nil {
 		return err
 	}
@@ -242,7 +258,7 @@ func resolveCRTransports(ctx context.Context, client *adt.Client, crID, attr str
 // level. We collect them all then filter by DD02L presence. Likewise
 // CROSS.TYPE='S' mixes tables and structures. DD02L with TABCLASS filter is
 // the truth source for what's actually a table or view.
-func collectCodeTables(ctx context.Context, client *adt.Client, wbTRs []string) (map[string][]graph.TableCodeRef, []CRDeletedRef, error) {
+func collectCodeTables(ctx context.Context, client *adt.Client, wbTRs []string, cache *auditCache) (map[string][]graph.TableCodeRef, []CRDeletedRef, error) {
 	result := make(map[string][]graph.TableCodeRef)
 	if len(wbTRs) == 0 {
 		return result, nil, nil
@@ -278,6 +294,19 @@ func collectCodeTables(ctx context.Context, client *adt.Client, wbTRs []string) 
 	total := len(objSet)
 	fmt.Fprintf(os.Stderr, "Scanning %d code objects for symbol references...\n", total)
 
+	// Sort the object list so output order is stable across runs — makes
+	// diffing two audits meaningful instead of "map randomised everything".
+	objList := make([]devObj, 0, len(objSet))
+	for o := range objSet {
+		objList = append(objList, o)
+	}
+	sort.Slice(objList, func(i, j int) bool {
+		if objList[i].objType != objList[j].objType {
+			return objList[i].objType < objList[j].objType
+		}
+		return objList[i].objName < objList[j].objName
+	})
+
 	// Step 2: for each object, query its symbol refs. Dedup by
 	// (symbol, fromInclude) so repeated references from the same include
 	// collapse into a single entry. Keep the raw map keyed by symbol name
@@ -288,7 +317,7 @@ func collectCodeTables(ctx context.Context, client *adt.Client, wbTRs []string) 
 	rawRefs := make(map[string][]graph.TableCodeRef)
 	prog := newProgress(total, 2)
 	done := 0
-	for obj := range objSet {
+	for _, obj := range objList {
 		fromObject := obj.objType + ":" + obj.objName
 		prog.tick(done, obj.objName)
 		refs := queryCodeRefsForObject(ctx, client, obj.objName, obj.objType)
@@ -318,7 +347,7 @@ func collectCodeTables(ctx context.Context, client *adt.Client, wbTRs []string) 
 	for s := range rawRefs {
 		symbols = append(symbols, s)
 	}
-	tableSet, err := filterDDICTables(ctx, client, symbols)
+	tableSet, err := filterDDICTables(ctx, client, symbols, cache)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -346,7 +375,7 @@ func collectCodeTables(ctx context.Context, client *adt.Client, wbTRs []string) 
 //   4. DD07L WHERE DOMNAME IN (<batch>) → (DOMNAME, DOMVALUE_L)  [fixed values]
 //
 // Batched to 5 names per IN clause to respect SAP freestyle 255-char limit.
-func walkDDICMetadata(ctx context.Context, client *adt.Client, tables map[string]bool) (map[string]graph.MetadataRef, error) {
+func walkDDICMetadata(ctx context.Context, client *adt.Client, tables map[string]bool, cache *auditCache) (map[string]graph.MetadataRef, error) {
 	result := make(map[string]graph.MetadataRef)
 	if len(tables) == 0 {
 		return result, nil
@@ -357,6 +386,17 @@ func walkDDICMetadata(ctx context.Context, client *adt.Client, tables map[string
 		tableList = append(tableList, t)
 	}
 	sort.Strings(tableList)
+
+	// L2 cache: hash the sorted table set — a re-run of the same CR
+	// (same scope tables) skips the entire DD03L/DD04L/DD01L/DD07L pass.
+	cacheKey := "ddic-walk:" + hashStringList(tableList)
+	if cache != nil {
+		var cached map[string]graph.MetadataRef
+		if cache.getJSON(cacheKey, &cached) {
+			fmt.Fprintf(os.Stderr, "DDIC metadata: %d objects (from L2 sqlite, key %s)\n", len(cached), cacheKey[:24])
+			return cached, nil
+		}
+	}
 
 	fmt.Fprintf(os.Stderr, "Walking DDIC metadata for %d tables (DD03L→DD04L→DD01L→DD07L)...\n", len(tableList))
 	prog := newProgress(4, 1)
@@ -511,6 +551,9 @@ func walkDDICMetadata(ctx context.Context, client *adt.Client, tables map[string
 	}
 
 	prog.done(4)
+	if cache != nil {
+		cache.putJSON(cacheKey, result)
+	}
 	return result, nil
 }
 
@@ -605,13 +648,13 @@ var ddicTableCache struct {
 // The bulk query is split by namespace prefix (Z/Y for custom, everything
 // else for SAP standard) so each response stays comfortably within ADT
 // transfer limits while the IN clause stays empty (literal length is zero).
-func filterDDICTables(ctx context.Context, client *adt.Client, names []string) (map[string]bool, error) {
+func filterDDICTables(ctx context.Context, client *adt.Client, names []string, cache *auditCache) (map[string]bool, error) {
 	out := make(map[string]bool)
 	if len(names) == 0 {
 		return out, nil
 	}
 	if !ddicTableCache.loaded {
-		if err := hydrateDDICTableCache(ctx, client); err != nil {
+		if err := hydrateDDICTableCache(ctx, client, cache); err != nil {
 			return nil, err
 		}
 	}
@@ -628,11 +671,25 @@ func filterDDICTables(ctx context.Context, client *adt.Client, names []string) (
 // queries. Custom-namespace tables (Z/Y) are typically < 10k rows total on
 // a customer system; SAP-standard tables are much larger but we split the
 // fetch by the DDIC name ranges SAP itself uses to keep each response small.
-func hydrateDDICTableCache(ctx context.Context, client *adt.Client) error {
+func hydrateDDICTableCache(ctx context.Context, client *adt.Client, cache *auditCache) error {
 	if ddicTableCache.loaded {
 		return nil
 	}
 	ddicTableCache.set = make(map[string]bool, 50000)
+
+	// Try the L2 (sqlite) cache first — one TTL-protected blob holds the
+	// entire DD02L snapshot. A warm hit skips every partition query below.
+	if cache != nil {
+		var names []string
+		if cache.getJSON("dd02l:all", &names) {
+			for _, n := range names {
+				ddicTableCache.set[n] = true
+			}
+			ddicTableCache.loaded = true
+			fmt.Fprintf(os.Stderr, "DD02L cache: %d tables/views (from L2 sqlite)\n", len(ddicTableCache.set))
+			return nil
+		}
+	}
 
 	// Partitioning: each slice is a DD02L WHERE-suffix. Custom Z/Y first
 	// (cheap), then SAP standard split by initial letter to keep each
@@ -676,6 +733,17 @@ func hydrateDDICTableCache(ctx context.Context, client *adt.Client) error {
 	prog.done(len(partitions))
 	ddicTableCache.loaded = true
 	fmt.Fprintf(os.Stderr, "DD02L cache: %d tables/views loaded\n", len(ddicTableCache.set))
+
+	// Persist the universe to L2 sqlite so a warm re-run skips the seven
+	// partition queries entirely.
+	if cache != nil {
+		names := make([]string, 0, len(ddicTableCache.set))
+		for n := range ddicTableCache.set {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		cache.putJSON("dd02l:all", names)
+	}
 	return nil
 }
 

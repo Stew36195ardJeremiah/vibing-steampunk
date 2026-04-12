@@ -7,6 +7,7 @@ import (
 	"html"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -515,8 +516,30 @@ func (c *Client) GetFunctionGroupAllSources(ctx context.Context, groupName strin
 		srcURIs = []string{fmt.Sprintf("/sap/bc/adt/functions/groups/%s/source/main", url.PathEscape(groupName))}
 	}
 
+	// Safety cap. A pathological function group with hundreds of FMs would
+	// otherwise produce a sequential fetch storm that looks like a hang. 150
+	// is well above the largest normal FUGR (~50 modules) and keeps worst-
+	// case latency bounded. We log when we cut things short so the caller
+	// knows the analysis is partial.
+	const maxFUGRSubfetches = 150
+	if len(srcURIs) > maxFUGRSubfetches {
+		fmt.Fprintf(os.Stderr, "    [FUGR %s] capped at %d of %d sub-URIs\n",
+			strings.ToUpper(groupName), maxFUGRSubfetches, len(srcURIs))
+		srcURIs = srcURIs[:maxFUGRSubfetches]
+	}
+
 	var combined strings.Builder
-	for _, uri := range srcURIs {
+	for i, uri := range srcURIs {
+		// Honour context cancellation so Ctrl-C works inside a big walk.
+		if err := ctx.Err(); err != nil {
+			return combined.String(), err
+		}
+		// Periodic visibility — without this a 50+ sub-fetch FUGR looks like
+		// a silent hang in cr-boundaries stderr output.
+		if i > 0 && i%10 == 0 {
+			fmt.Fprintf(os.Stderr, "    [FUGR %s] %d/%d sub-sources fetched\n",
+				strings.ToUpper(groupName), i, len(srcURIs))
+		}
 		r, err := c.transport.Request(ctx, uri, &RequestOptions{
 			Method: http.MethodGet,
 			Accept: "text/plain",

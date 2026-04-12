@@ -994,12 +994,25 @@ func analyzeTRBoundariesCLI(ctx context.Context, client *adt.Client, trList []st
 		Objects:    scopeObjects,
 	}
 
-	// Step 2: Build dependency graph
+	// Step 2: Build dependency graph. Sort the object list so the analysis
+	// (and its stderr "Analyzing X..." trace) is stable across runs — makes
+	// the maxObjects=50 cap deterministic and diffing reports meaningful.
+	sortedObjs := make([]objKey, 0, len(objectSet))
+	for k := range objectSet {
+		sortedObjs = append(sortedObjs, k)
+	}
+	sort.Slice(sortedObjs, func(i, j int) bool {
+		if sortedObjs[i].objType != sortedObjs[j].objType {
+			return sortedObjs[i].objType < sortedObjs[j].objType
+		}
+		return sortedObjs[i].objName < sortedObjs[j].objName
+	})
+
 	g := graph.New()
 	maxObjects := 50
 	count := 0
 
-	for obj := range objectSet {
+	for _, obj := range sortedObjs {
 		if count >= maxObjects {
 			break
 		}
