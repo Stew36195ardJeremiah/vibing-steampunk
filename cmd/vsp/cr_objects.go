@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/oisee/vibing-steampunk/pkg/adt"
@@ -40,9 +41,10 @@ type CRDeletedRef struct {
 // nonexistent entries are surfaced separately rather than silently errored
 // out at source-fetch time.
 //
-// The returned CRDevObject slice is sorted for stable output. Any LIMU kinds
-// we do not know how to map (e.g. DOCU, MESS) are ignored; the caller gets a
-// warning count but they are not considered code objects.
+// The returned CRDevObject and CRDeletedRef slices are sorted for stable
+// output. Any LIMU kinds we do not know how to map (e.g. DOCU, MESS) are
+// ignored; the caller gets a warning count but they are not considered code
+// objects.
 func collectCRDevObjects(ctx context.Context, client *adt.Client, trList []string) ([]CRDevObject, []CRDeletedRef, error) {
 	if len(trList) == 0 {
 		return nil, nil, nil
@@ -140,6 +142,19 @@ func collectCRDevObjects(ctx context.Context, client *adt.Client, trList []strin
 		p.Package = tadirRow.devclass
 		live = append(live, *p)
 	}
+
+	sort.Slice(live, func(i, j int) bool {
+		if live[i].ObjectType != live[j].ObjectType {
+			return live[i].ObjectType < live[j].ObjectType
+		}
+		return live[i].ObjectName < live[j].ObjectName
+	})
+	sort.Slice(deleted, func(i, j int) bool {
+		if deleted[i].ObjectType != deleted[j].ObjectType {
+			return deleted[i].ObjectType < deleted[j].ObjectType
+		}
+		return deleted[i].ObjectName < deleted[j].ObjectName
+	})
 
 	return live, deleted, nil
 }

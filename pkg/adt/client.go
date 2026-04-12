@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -515,6 +516,7 @@ func (c *Client) GetFunctionGroupAllSources(ctx context.Context, groupName strin
 		// Fallback: at least fetch the top-level source so we get something.
 		srcURIs = []string{fmt.Sprintf("/sap/bc/adt/functions/groups/%s/source/main", url.PathEscape(groupName))}
 	}
+	sort.Strings(srcURIs)
 
 	// Safety cap. A pathological function group with hundreds of FMs would
 	// otherwise produce a sequential fetch storm that looks like a hang. 150
@@ -527,27 +529,64 @@ func (c *Client) GetFunctionGroupAllSources(ctx context.Context, groupName strin
 			strings.ToUpper(groupName), maxFUGRSubfetches, len(srcURIs))
 		srcURIs = srcURIs[:maxFUGRSubfetches]
 	}
+	fmt.Fprintf(os.Stderr, "    [FUGR %s] fetching %d sub-sources\n",
+		strings.ToUpper(groupName), len(srcURIs))
+
+	type fetchResult struct {
+		idx  int
+		body string
+	}
+	const fugrWorkers = 6
+	jobCh := make(chan int)
+	resCh := make(chan fetchResult, len(srcURIs))
+
+	var wg sync.WaitGroup
+	for w := 0; w < fugrWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobCh {
+				if ctx.Err() != nil {
+					return
+				}
+				r, err := c.transport.Request(ctx, srcURIs[idx], &RequestOptions{
+					Method: http.MethodGet,
+					Accept: "text/plain",
+				})
+				if err != nil {
+					resCh <- fetchResult{idx: idx}
+					continue
+				}
+				resCh <- fetchResult{idx: idx, body: string(r.Body)}
+			}
+		}()
+	}
+	go func() {
+		for idx := range srcURIs {
+			jobCh <- idx
+		}
+		close(jobCh)
+		wg.Wait()
+		close(resCh)
+	}()
+
+	results := make([]string, len(srcURIs))
+	completed := 0
+	for res := range resCh {
+		results[res.idx] = res.body
+		completed++
+		if completed == len(srcURIs) || completed%5 == 0 {
+			fmt.Fprintf(os.Stderr, "    [FUGR %s] %d/%d sub-sources fetched\n",
+				strings.ToUpper(groupName), completed, len(srcURIs))
+		}
+	}
 
 	var combined strings.Builder
-	for i, uri := range srcURIs {
-		// Honour context cancellation so Ctrl-C works inside a big walk.
-		if err := ctx.Err(); err != nil {
-			return combined.String(), err
-		}
-		// Periodic visibility — without this a 50+ sub-fetch FUGR looks like
-		// a silent hang in cr-boundaries stderr output.
-		if i > 0 && i%10 == 0 {
-			fmt.Fprintf(os.Stderr, "    [FUGR %s] %d/%d sub-sources fetched\n",
-				strings.ToUpper(groupName), i, len(srcURIs))
-		}
-		r, err := c.transport.Request(ctx, uri, &RequestOptions{
-			Method: http.MethodGet,
-			Accept: "text/plain",
-		})
-		if err != nil {
+	for _, body := range results {
+		if body == "" {
 			continue
 		}
-		combined.Write(r.Body)
+		combined.WriteString(body)
 		combined.WriteString("\n")
 	}
 	return combined.String(), nil
@@ -655,14 +694,14 @@ func (c *Client) GetSRVD(ctx context.Context, srvdName string) (string, error) {
 
 // ServiceBinding represents an OData Service Binding metadata
 type ServiceBinding struct {
-	Name            string `json:"name"`
-	Type            string `json:"type"`
-	Description     string `json:"description"`
-	Published       bool   `json:"published"`
-	BindingType     string `json:"bindingType"`     // ODATA
-	BindingVersion  string `json:"bindingVersion"`  // V2, V4
-	ServiceURL      string `json:"serviceUrl,omitempty"`
-	ServiceDefName  string `json:"serviceDefName,omitempty"`
+	Name           string `json:"name"`
+	Type           string `json:"type"`
+	Description    string `json:"description"`
+	Published      bool   `json:"published"`
+	BindingType    string `json:"bindingType"`    // ODATA
+	BindingVersion string `json:"bindingVersion"` // V2, V4
+	ServiceURL     string `json:"serviceUrl,omitempty"`
+	ServiceDefName string `json:"serviceDefName,omitempty"`
 }
 
 // GetSRVB retrieves metadata for a Service Binding.
@@ -720,13 +759,13 @@ func parseSRVBMetadata(data []byte) (*ServiceBinding, error) {
 	}
 
 	return &ServiceBinding{
-		Name:            root.Name,
-		Type:            root.Type,
-		Description:     root.Description,
-		Published:       root.Published,
-		BindingType:     root.Binding.Type,
-		BindingVersion:  root.Binding.Version,
-		ServiceDefName:  root.Services.Content.ServiceDef.Name,
+		Name:           root.Name,
+		Type:           root.Type,
+		Description:    root.Description,
+		Published:      root.Published,
+		BindingType:    root.Binding.Type,
+		BindingVersion: root.Binding.Version,
+		ServiceDefName: root.Services.Content.ServiceDef.Name,
 	}, nil
 }
 
@@ -1429,11 +1468,11 @@ func FlattenCallGraph(root *CallGraphNode) []CallGraphEdge {
 
 // CallGraphStats provides statistics about a call graph.
 type CallGraphStats struct {
-	TotalNodes   int            `json:"total_nodes"`
-	TotalEdges   int            `json:"total_edges"`
-	MaxDepth     int            `json:"max_depth"`
-	NodesByType  map[string]int `json:"nodes_by_type"`
-	UniqueNodes  []string       `json:"unique_nodes"`
+	TotalNodes  int            `json:"total_nodes"`
+	TotalEdges  int            `json:"total_edges"`
+	MaxDepth    int            `json:"max_depth"`
+	NodesByType map[string]int `json:"nodes_by_type"`
+	UniqueNodes []string       `json:"unique_nodes"`
 }
 
 // AnalyzeCallGraph computes statistics for a call graph.
@@ -1472,10 +1511,10 @@ func AnalyzeCallGraph(root *CallGraphNode) *CallGraphStats {
 
 // CallGraphComparison compares static and actual call graphs.
 type CallGraphComparison struct {
-	CommonEdges    []CallGraphEdge `json:"common_edges"`    // In both static and actual
-	StaticOnly     []CallGraphEdge `json:"static_only"`     // In static but not executed
-	ActualOnly     []CallGraphEdge `json:"actual_only"`     // Executed but not in static (dynamic calls)
-	CoverageRatio  float64         `json:"coverage_ratio"`  // Actual/Static ratio
+	CommonEdges   []CallGraphEdge `json:"common_edges"`   // In both static and actual
+	StaticOnly    []CallGraphEdge `json:"static_only"`    // In static but not executed
+	ActualOnly    []CallGraphEdge `json:"actual_only"`    // Executed but not in static (dynamic calls)
+	CoverageRatio float64         `json:"coverage_ratio"` // Actual/Static ratio
 }
 
 // CompareCallGraphs compares a static call graph with an actual execution trace.
@@ -1972,10 +2011,10 @@ func (c *Client) GetDump(ctx context.Context, dumpID string) (*DumpDetails, erro
 
 // dumpEntryXML is used for parsing dump feed entries.
 type dumpEntryXML struct {
-	ID        string `xml:"id"`
-	Title     string `xml:"title"`
-	Updated   string `xml:"updated"`
-	Category  struct {
+	ID       string `xml:"id"`
+	Title    string `xml:"title"`
+	Updated  string `xml:"updated"`
+	Category struct {
 		Term string `xml:"term,attr"`
 	} `xml:"category"`
 	Link struct {
@@ -1984,9 +2023,9 @@ type dumpEntryXML struct {
 	Content struct {
 		Type   string `xml:"type,attr"`
 		Source struct {
-			Line          string `xml:"line,attr"`
-			Program       string `xml:"program,attr"`
-			Include       string `xml:"include,attr"`
+			Line    string `xml:"line,attr"`
+			Program string `xml:"program,attr"`
+			Include string `xml:"include,attr"`
 		} `xml:"source"`
 		Exception struct {
 			Type string `xml:"type,attr"`
@@ -2096,8 +2135,8 @@ type TraceEntry struct {
 	Program     string  `json:"program,omitempty"`
 	Event       string  `json:"event,omitempty"`
 	Line        int     `json:"line,omitempty"`
-	GrossTime   int64   `json:"grossTime,omitempty"`   // microseconds
-	NetTime     int64   `json:"netTime,omitempty"`     // microseconds
+	GrossTime   int64   `json:"grossTime,omitempty"` // microseconds
+	NetTime     int64   `json:"netTime,omitempty"`   // microseconds
 	Calls       int     `json:"calls,omitempty"`
 	Percentage  float64 `json:"percentage,omitempty"`
 	Statement   string  `json:"statement,omitempty"`
@@ -2293,12 +2332,12 @@ func parseTraceAnalysis(data []byte, traceID, toolType string) (*TraceAnalysis, 
 
 // SQLTraceState represents the current state of SQL tracing.
 type SQLTraceState struct {
-	Active      bool   `json:"active"`
-	User        string `json:"user,omitempty"`
-	TraceType   string `json:"traceType,omitempty"`
-	StartTime   string `json:"startTime,omitempty"`
-	MaxRecords  int    `json:"maxRecords,omitempty"`
-	TraceFile   string `json:"traceFile,omitempty"`
+	Active     bool   `json:"active"`
+	User       string `json:"user,omitempty"`
+	TraceType  string `json:"traceType,omitempty"`
+	StartTime  string `json:"startTime,omitempty"`
+	MaxRecords int    `json:"maxRecords,omitempty"`
+	TraceFile  string `json:"traceFile,omitempty"`
 }
 
 // SQLTraceEntry represents a trace file in the directory.
