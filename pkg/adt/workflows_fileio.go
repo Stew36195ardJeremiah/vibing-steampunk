@@ -26,29 +26,35 @@ type RenameObjectResult struct {
 //
 // This is a destructive operation - use with caution!
 func (c *Client) RenameObject(ctx context.Context, objType CreatableObjectType, oldName, newName, packageName, transport string) (*RenameObjectResult, error) {
-	// Safety check
-	if err := c.checkSafety(OpDelete, "RenameObject"); err != nil {
-		return nil, err
-	}
-
 	result := &RenameObjectResult{
 		OldName:    oldName,
 		NewName:    newName,
 		ObjectType: string(objType),
 	}
 
-	// Check package safety for the old object being renamed
 	oldURL, err := c.buildObjectURL(objType, oldName)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.checkObjectPackageSafety(ctx, oldURL); err != nil {
+
+	// Unified mutation policy gate for the old object being deleted.
+	if err := c.checkMutation(ctx, MutationContext{
+		Op:        OpDelete,
+		OpName:    "RenameObject",
+		ObjectURL: oldURL,
+		Transport: transport,
+	}); err != nil {
 		return nil, err
 	}
 
-	// Check package safety for the target package
+	// If a target package is supplied, gate the create side as well.
 	if packageName != "" {
-		if err := c.checkPackageSafety(packageName); err != nil {
+		if err := c.checkMutation(ctx, MutationContext{
+			Op:        OpCreate,
+			OpName:    "RenameObject",
+			Package:   packageName,
+			Transport: transport,
+		}); err != nil {
 			return nil, err
 		}
 	}

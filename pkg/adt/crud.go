@@ -113,14 +113,13 @@ func (c *Client) UnlockObject(ctx context.Context, objectURL string, lockHandle 
 // lockHandle is required (from LockObject)
 // transport is optional (for transportable objects)
 func (c *Client) UpdateSource(ctx context.Context, objectSourceURL string, source string, lockHandle string, transport string) error {
-	// Safety check
-	if err := c.checkSafety(OpUpdate, "UpdateSource"); err != nil {
-		return err
-	}
-	if err := c.checkObjectPackageSafety(ctx, objectSourceURL); err != nil {
-		return err
-	}
-	if err := c.checkTransportableEdit(transport, "UpdateSource"); err != nil {
+	// Unified mutation policy gate (op type + package + transport)
+	if err := c.checkMutation(ctx, MutationContext{
+		Op:        OpUpdate,
+		OpName:    "UpdateSource",
+		ObjectURL: objectSourceURL,
+		Transport: transport,
+	}); err != nil {
 		return err
 	}
 
@@ -318,11 +317,6 @@ func (c *Client) packageExists(ctx context.Context, packageName string) bool {
 // This prevents orphan ENQUEUE locks that SAP creates internally during CreateObject
 // before validating the request. These orphan locks can only be cleared via SM12.
 func (c *Client) CreateObject(ctx context.Context, opts CreateObjectOptions) error {
-	// Safety check
-	if err := c.checkSafety(OpCreate, "CreateObject"); err != nil {
-		return err
-	}
-
 	typeInfo, ok := objectTypes[opts.ObjectType]
 	if !ok {
 		return fmt.Errorf("unsupported object type: %s", opts.ObjectType)
@@ -331,13 +325,19 @@ func (c *Client) CreateObject(ctx context.Context, opts CreateObjectOptions) err
 	opts.Name = strings.ToUpper(opts.Name)
 	opts.PackageName = strings.ToUpper(opts.PackageName)
 
-	// Check package restrictions
 	// For package creation, check the package being created (opts.Name), not the parent (opts.PackageName)
 	packageToCheck := opts.PackageName
 	if opts.ObjectType == ObjectTypePackage {
 		packageToCheck = opts.Name
 	}
-	if err := c.checkPackageSafety(packageToCheck); err != nil {
+
+	// Unified mutation policy gate (op type + package + transport)
+	if err := c.checkMutation(ctx, MutationContext{
+		Op:        OpCreate,
+		OpName:    "CreateObject",
+		Package:   packageToCheck,
+		Transport: opts.Transport,
+	}); err != nil {
 		return err
 	}
 
@@ -604,14 +604,13 @@ func escapeXML(s string) string {
 // lockHandle is required (from LockObject)
 // transport is optional (for transportable objects)
 func (c *Client) DeleteObject(ctx context.Context, objectURL string, lockHandle string, transport string) error {
-	// Safety check
-	if err := c.checkSafety(OpDelete, "DeleteObject"); err != nil {
-		return err
-	}
-	if err := c.checkObjectPackageSafety(ctx, objectURL); err != nil {
-		return err
-	}
-	if err := c.checkTransportableEdit(transport, "DeleteObject"); err != nil {
+	// Unified mutation policy gate (op type + package + transport)
+	if err := c.checkMutation(ctx, MutationContext{
+		Op:        OpDelete,
+		OpName:    "DeleteObject",
+		ObjectURL: objectURL,
+		Transport: transport,
+	}); err != nil {
 		return err
 	}
 
@@ -724,10 +723,14 @@ func GetClassIncludeSourceURL(className string, includeType ClassIncludeType) st
 // Supports namespaced classes.
 func (c *Client) CreateTestInclude(ctx context.Context, className string, lockHandle string, transport string) error {
 	className = strings.ToUpper(className)
-	if err := c.checkObjectPackageSafety(ctx, GetObjectURL(ObjectTypeClass, className, "")); err != nil {
-		return err
-	}
-	if err := c.checkTransportableEdit(transport, "CreateTestInclude"); err != nil {
+
+	// Unified mutation policy gate (op type + parent class package + transport)
+	if err := c.checkMutation(ctx, MutationContext{
+		Op:        OpCreate,
+		OpName:    "CreateTestInclude",
+		ObjectURL: GetObjectURL(ObjectTypeClass, className, ""),
+		Transport: transport,
+	}); err != nil {
 		return err
 	}
 
@@ -775,10 +778,14 @@ func (c *Client) GetClassInclude(ctx context.Context, className string, includeT
 // Requires a lock on the parent class.
 func (c *Client) UpdateClassInclude(ctx context.Context, className string, includeType ClassIncludeType, source string, lockHandle string, transport string) error {
 	sourceURL := GetClassIncludeSourceURL(className, includeType)
-	if err := c.checkObjectPackageSafety(ctx, sourceURL); err != nil {
-		return err
-	}
-	if err := c.checkTransportableEdit(transport, "UpdateClassInclude"); err != nil {
+
+	// Unified mutation policy gate (op type + package + transport)
+	if err := c.checkMutation(ctx, MutationContext{
+		Op:        OpUpdate,
+		OpName:    "UpdateClassInclude",
+		ObjectURL: sourceURL,
+		Transport: transport,
+	}); err != nil {
 		return err
 	}
 

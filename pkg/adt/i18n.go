@@ -121,16 +121,16 @@ func (c *Client) GetMessageClassTexts(ctx context.Context, name, lang string) ([
 // WriteMessageClassTexts updates message class texts in a specific language.
 // Requires a lock handle from LockObject and optionally a transport request number.
 func (c *Client) WriteMessageClassTexts(ctx context.Context, name, lang string, texts []MessageClassMessage, lockHandle, transport string) error {
-	if err := c.checkSafety(OpUpdate, "WriteMessageClassTexts"); err != nil {
-		return err
-	}
-
 	name = strings.ToUpper(name)
 	lang = strings.ToUpper(lang)
-	if err := c.checkObjectPackageSafety(ctx, fmt.Sprintf("/sap/bc/adt/messageclass/%s", url.PathEscape(strings.ToLower(name)))); err != nil {
-		return err
-	}
-	if err := c.checkTransportableEdit(transport, "WriteMessageClassTexts"); err != nil {
+
+	// Unified mutation policy gate (op type + package + transport)
+	if err := c.checkMutation(ctx, MutationContext{
+		Op:        OpUpdate,
+		OpName:    "WriteMessageClassTexts",
+		ObjectURL: fmt.Sprintf("/sap/bc/adt/messageclass/%s", url.PathEscape(strings.ToLower(name))),
+		Transport: transport,
+	}); err != nil {
 		return err
 	}
 
@@ -169,16 +169,16 @@ func (c *Client) WriteMessageClassTexts(ctx context.Context, name, lang string, 
 // WriteDataElementLabels updates data element labels in a specific language.
 // Requires a lock handle from LockObject and optionally a transport request number.
 func (c *Client) WriteDataElementLabels(ctx context.Context, name, lang string, labels *DataElementLabels, lockHandle, transport string) error {
-	if err := c.checkSafety(OpUpdate, "WriteDataElementLabels"); err != nil {
-		return err
-	}
-
 	name = strings.ToUpper(name)
 	lang = strings.ToUpper(lang)
-	if err := c.checkObjectPackageSafety(ctx, fmt.Sprintf("/sap/bc/adt/ddic/dataelements/%s", url.PathEscape(name))); err != nil {
-		return err
-	}
-	if err := c.checkTransportableEdit(transport, "WriteDataElementLabels"); err != nil {
+
+	// Unified mutation policy gate (op type + package + transport)
+	if err := c.checkMutation(ctx, MutationContext{
+		Op:        OpUpdate,
+		OpName:    "WriteDataElementLabels",
+		ObjectURL: fmt.Sprintf("/sap/bc/adt/ddic/dataelements/%s", url.PathEscape(name)),
+		Transport: transport,
+	}); err != nil {
 		return err
 	}
 
