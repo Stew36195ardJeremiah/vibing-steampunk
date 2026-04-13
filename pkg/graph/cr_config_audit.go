@@ -210,8 +210,6 @@ type CRConfigAuditSummary struct {
 // StandardReads (informational, never a gap). A table transported without
 // code reading it lands in Orphan. A table in both ends up in Covered.
 func FinalizeCRConfigAuditReport(r *CRConfigAuditReport) {
-	deliveryClass := map[string]string{} // reserved for future DD02L enrichment
-
 	codeTables := sortedKeys(r.CodeTables)
 	custTables := sortedKeys(r.CustTables)
 
@@ -312,15 +310,20 @@ func FinalizeCRConfigAuditReport(r *CRConfigAuditReport) {
 		customRead++
 	}
 
+	// parseFlag is already declared above; orphan path reuses the
+	// same packed "CONTFLAG|TABCLASS" format that r.DeliveryClasses
+	// carries per table.
 	for _, t := range custTables {
 		if codeSet[t] {
 			continue // already handled under Covered
 		}
-		r.Orphan = append(r.Orphan, CoverageEntry{
+		contflag, _ := parseFlag(r.DeliveryClasses[t])
+		entry := CoverageEntry{
 			Table:         t,
-			DeliveryClass: deliveryClass[t],
+			DeliveryClass: contflag,
 			CustRows:      r.CustTables[t],
-		})
+		}
+		r.Orphan = append(r.Orphan, entry)
 	}
 
 	// Metadata cross-match: iterate reachable (from code-side tables) vs

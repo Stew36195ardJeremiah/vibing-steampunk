@@ -170,6 +170,23 @@ func runCRConfigAudit(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "Data-side: %d unique tables with transported rows\n", len(custTables))
 
+	// Enrich deliveryClasses so Orphan-side tables also carry their
+	// CONTFLAG/TABCLASS. The hydrated DD02L cache has every table on
+	// the system, so this is just in-memory lookups — no extra SAP
+	// traffic. Finalize uses these entries to classify orphans the
+	// same way it classifies code reads (transactional, view,
+	// unknown, genuine customising orphan).
+	for t := range custTables {
+		if _, already := deliveryClasses[t]; already {
+			continue
+		}
+		if ddicTableCache.loaded {
+			if packed, ok := ddicTableCache.flags[t]; ok {
+				deliveryClasses[t] = packed
+			}
+		}
+	}
+
 	// v1.2a: DDIC metadata chain expansion. Walk every in-scope table through
 	// DD03L→DD04L→DD01L→DD07L to collect every data element / domain / check
 	// table / fixed-value set the code transitively depends on, then pull
@@ -1621,26 +1638,53 @@ func printCRConfigAuditText(r *graph.CRConfigAuditReport, details bool) {
 	}
 
 	if len(r.Orphan) > 0 {
-		// Split orphans into two visual groups: those reachable from
-		// in-scope code via a 1-hop call chain (annotation only, still
-		// orphan for bookkeeping) and the genuinely unreferenced ones.
-		// The transitive group is less alarming — the CR's code does
-		// drive the table, just through a helper function we can't see
-		// in direct code-refs. Showing the chain keeps the user informed
-		// without quietly hiding a real issue.
-		var transitive, deadEnd []graph.CoverageEntry
+		// Three visual groups based on signal strength:
+		//   1. transitive: orphan table reachable from in-scope code
+		//      via a 1-hop call chain. Weakest alarm — the chain is
+		//      real, we just couldn't see it in direct code-refs.
+		//   2. transactional: orphan whose DDIC delivery class says
+		//      the rows are application / runtime / system state.
+		//      Shipping test data for such tables is unusual but not
+		//      invalid — surface as info, not alarm.
+		//   3. customising: the real signal. Custom customising table
+		//      whose rows ride in the CR but no code in the CR reads
+		//      them. Either forgotten reader (bug) or dead config
+		//      (cleanup candidate).
+		var transitive, transactional, customising []graph.CoverageEntry
 		for _, e := range r.Orphan {
-			if len(e.TransitiveReach) > 0 {
+			switch {
+			case len(e.TransitiveReach) > 0:
 				transitive = append(transitive, e)
-			} else {
-				deadEnd = append(deadEnd, e)
+			case e.DeliveryClass == "A" || e.DeliveryClass == "L" || e.DeliveryClass == "S":
+				transactional = append(transactional, e)
+			default:
+				customising = append(customising, e)
 			}
 		}
 
-		if len(deadEnd) > 0 {
-			fmt.Println("ORPHAN — transported rows for tables no code in CR references:")
-			for _, e := range deadEnd {
-				fmt.Printf("  %-25s  %d rows\n", e.Table, len(e.CustRows))
+		if len(customising) > 0 {
+			fmt.Println("ORPHAN — transported rows for customising tables no code in CR references:")
+			for _, e := range customising {
+				label := e.Table
+				if e.DeliveryClass != "" {
+					label = fmt.Sprintf("%-25s  [%s]", e.Table, e.DeliveryClass)
+				} else {
+					label = fmt.Sprintf("%-25s", e.Table)
+				}
+				fmt.Printf("  %s  %d rows\n", label, len(e.CustRows))
+				if details {
+					for _, row := range e.CustRows {
+						fmt.Printf("    %s  %s  TABKEY=%s\n", row.TRKORR, row.ObjFunc, row.TabKey)
+					}
+				}
+			}
+			fmt.Println()
+		}
+
+		if len(transactional) > 0 {
+			fmt.Printf("ORPHAN (transactional — CONTFLAG A/L/S, runtime data travelling in a transport is unusual but legal) (%d):\n", len(transactional))
+			for _, e := range transactional {
+				fmt.Printf("  %-25s  [%s]  %d rows\n", e.Table, e.DeliveryClass, len(e.CustRows))
 				if details {
 					for _, row := range e.CustRows {
 						fmt.Printf("    %s  %s  TABKEY=%s\n", row.TRKORR, row.ObjFunc, row.TabKey)
