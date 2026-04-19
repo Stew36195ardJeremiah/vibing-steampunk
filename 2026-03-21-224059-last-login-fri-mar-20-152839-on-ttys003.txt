@@ -16,8 +16,9 @@
 # added to ~/.zshrc on alice-2:                                                 
 # alias vsp='ssh -t ii7 "tmux a -t vsp || tmux new -s vsp"'                    
 # alias vsplog='ssh ii7 "cat ~/dev/vibing-steampunk/dev.log"'                  
-                                                                                
-                                                                                
+# alias vspsync='ssh ii7 "cd ~/dev/vibing-steampunk && git pull"'              
+#                                                                               
+# NOTE: run vspsync before attaching if it's been >1 day since last session     
                                                                                 
                                                                                 
                                                                                 
