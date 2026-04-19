@@ -18,9 +18,11 @@
 # alias vsplog='ssh ii7 "cat ~/dev/vibing-steampunk/dev.log"'                  
 # alias vspsync='ssh ii7 "cd ~/dev/vibing-steampunk && git pull"'              
 # alias vspstatus='ssh ii7 "cd ~/dev/vibing-steampunk && git status"'          
+# alias vspdiff='ssh ii7 "cd ~/dev/vibing-steampunk && git diff"'              
 #                                                                               
 # NOTE: run vspsync before attaching if it's been >1 day since last session     
 # NOTE: run vspstatus to check for uncommitted changes before disconnecting     
+# NOTE: run vspdiff to review changes before committing                         
                                                                                 
                                                                                 
                                                                                 
