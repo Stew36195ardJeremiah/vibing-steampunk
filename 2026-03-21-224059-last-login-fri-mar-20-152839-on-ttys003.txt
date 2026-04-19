@@ -12,12 +12,10 @@
 # to create session if not exists: tmux new -s vsp                              
 # to list sessions: tmux ls                                                     
 # shortcut: alias vsp='ssh -t ii7 "tmux a -t vsp || tmux new -s vsp"'           
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
+#                                                                               
+# added to ~/.zshrc on alice-2:                                                 
+# alias vsp='ssh -t ii7 "tmux a -t vsp || tmux new -s vsp"'                    
+# alias vsplog='ssh ii7 "cat ~/dev/vibing-steampunk/dev.log"'                  
                                                                                 
                                                                                 
                                                                                 
