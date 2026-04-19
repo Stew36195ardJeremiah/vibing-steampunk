@@ -10,11 +10,8 @@
 # NOTE: ii7 is my home server (192.168.1.77)                                    
 # tmux session 'vsp' = vibing-steampunk dev environment                         
 # to create session if not exists: tmux new -s vsp                              
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
+# to list sessions: tmux ls                                                     
+# shortcut: alias vsp='ssh -t ii7 "tmux a -t vsp || tmux new -s vsp"'           
                                                                                 
                                                                                 
                                                                                 
