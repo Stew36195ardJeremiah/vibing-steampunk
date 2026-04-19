@@ -19,7 +19,9 @@ var rootCmd = &cobra.Command{
 	Use:   "vibing-steampunk",
 	Short: "A steampunk-themed vibing tool",
 	Long: `vibing-steampunk is a tool for generating steampunk-themed
-content and visualizations. Embrace the gears, the steam, and the vibe.`,
+content and visualizations. Embrace the gears, the steam, and the vibe.
+
+Personal fork: tweaked for my own experimentation and learning.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return cmd.Help()
 	},
