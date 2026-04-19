@@ -21,7 +21,8 @@ var rootCmd = &cobra.Command{
 	Long: `vibing-steampunk is a tool for generating steampunk-themed
 content and visualizations. Embrace the gears, the steam, and the vibe.
 
-Personal fork: tweaked for my own experimentation and learning.`,
+Personal fork: tweaked for my own experimentation and learning.
+See also: https://github.com/oisee/vibing-steampunk (upstream)`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return cmd.Help()
 	},
@@ -33,6 +34,7 @@ var versionCmd = &cobra.Command{
 	Short: "Print version information",
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Printf("vibing-steampunk %s (commit: %s, built: %s)\n", version, commit, date)
+		fmt.Println("(personal fork — upstream: github.com/oisee/vibing-steampunk)")
 	},
 }
 
